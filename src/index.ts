@@ -40,7 +40,12 @@ const dataDir = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
 
 const session = problem
   ? null
-  : new OdaSession(process.env.ODA_EMAIL!, process.env.ODA_PASSWORD!, dataDir);
+  : new OdaSession(
+      process.env.ODA_EMAIL!.trim(),
+      // A password pasted into a variable form can pick up a trailing newline.
+      process.env.ODA_PASSWORD!.replace(/\r?\n$/, ""),
+      dataDir,
+    );
 
 if (problem) {
   console.error(`MCP endpoint closed: ${problem}`);

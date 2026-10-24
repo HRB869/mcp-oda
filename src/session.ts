@@ -68,7 +68,7 @@ export class OdaSession {
               ...this.status,
               logged_in: false,
               user: null,
-              last_error: "Oda rejected the email/password",
+              last_error: `Oda rejected the login: ${this.client.lastLoginFailure ?? "no detail"}`,
             };
             return false;
           }

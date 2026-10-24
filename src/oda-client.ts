@@ -1458,18 +1458,26 @@ export class OdaClient {
     );
 
     if (response.ok) {
+      this.lastLoginFailure = null;
       this.saveCookies();
       return true;
     }
 
     // Only credential-type rejections mean "wrong username/password"; a 5xx
     // or anything unexpected is a server problem and must not be reported as
-    // bad credentials.
+    // bad credentials. Keep Oda's own answer (status + a short excerpt of the
+    // body, which never echoes the credentials) so the operator can tell a
+    // typo from a changed endpoint.
     if ([400, 401, 403].includes(response.status)) {
+      const body = await response.text().catch(() => "");
+      this.lastLoginFailure = `HTTP ${response.status}${body ? ` – ${body.replace(/\s+/g, " ").slice(0, 300)}` : ""}`;
       return false;
     }
     return this.throwApiError("Login", response);
   }
+
+  /** Oda's answer to the last failed login, for diagnostics. */
+  lastLoginFailure: string | null = null;
 
   async checkUser(): Promise<string | null> {
     // Use dehydrated query "user" from any page
