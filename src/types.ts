@@ -176,3 +176,19 @@ export interface DeliverySlots {
   /** Cart-dependent warnings, e.g. items not purchasable before a date. */
   validation_messages: string[];
 }
+
+export interface RecentOrderItem {
+  product_id: number;
+  name: string;
+  quantity: number;
+  /** Recipe name when Oda grouped the line under a recipe. */
+  group_title?: string;
+}
+
+export interface RecentOrder {
+  order_number: string;
+  /** Delivery date (or order date when delivery date is unknown), as Oda gives it. */
+  date: string;
+  total: number;
+  items: RecentOrderItem[];
+}

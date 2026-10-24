@@ -1,15 +1,11 @@
 {
-  "name": "mcp-oda",
-  "version": "2.0.1",
-  "description": "Integration with Oda for searching products and managing your shopping cart.",
+  "name": "oda-connector",
+  "version": "0.1.0",
+  "description": "Hosted MCP connector for Oda (oda.com) grocery shopping, for Claude. Built on gbbirkisson/mcp-oda.",
   "main": "dist/index.js",
-  "bin": {
-    "mcp-oda": "dist/index.js"
-  },
   "type": "module",
   "scripts": {
-    "build": "tsc && chmod +x dist/index.js",
-    "prepare": "npm run build",
+    "build": "tsc",
     "start": "node dist/index.js",
     "lint": "eslint src tests",
     "format": "prettier --write \"src/**/*.ts\"",
@@ -17,8 +13,6 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
-    "commander": "^15.0.0",
-    "tsx": "^4.21.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
@@ -30,8 +24,7 @@
     "typescript-eslint": "^8.54.0",
     "vitest": "^5.0.0"
   },
-  "files": [
-    "dist",
-    "run.sh"
-  ]
+  "engines": {
+    "node": ">=22"
+  }
 }

@@ -1,179 +1,90 @@
-<h1>
-  <p align="center">
-    <a href="https://github.com/gbbirkisson/mcp-oda">
-      <img src="mcp.svg" alt="Logo" height="128">
-    </a>
-    <br>mcp-oda
-  </p>
-</h1>
+# oda-connector
 
-<p align="center">
-  A Model Context Protocol (MCP) server for interacting with <a href="https://oda.com">oda.com</a>
-</p>
+A hosted MCP connector that lets Claude (web, desktop and mobile) search Oda, fill the
+cart from order history and recipes, and read delivery slots. It runs as one Railway
+service and is added to Claude as a custom connector. Built for a weekly family shop:
+capture things during the week, pick dinners on Friday, cart fills itself, she checks
+out in the Oda app.
 
-If this project is just what you needed and/or has been helpful to you, please consider buying
-me a coffee ☕
+It is a fork of [gbbirkisson/mcp-oda](https://github.com/gbbirkisson/mcp-oda), which
+did the work of understanding Oda's private endpoints. This fork keeps that client
+(`src/oda-client.ts`) and replaces the local CLI/stdio server with a hosted
+streamable-HTTP server that logs in from environment variables.
 
-[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/gbbirkisson)
+**There is no checkout, slot booking or payment in this code, on purpose.** Claude
+fills the cart; a person pays.
 
-<h2>Table of contents</h2>
+## What Claude can do
 
-<!-- vim-markdown-toc GFM -->
+| Tool | What it does |
+|---|---|
+| `products_search` | Search the catalogue (Norwegian terms). Returns ids, prices, availability. |
+| `cart_get_contents` | The cart as it stands. |
+| `cart_add_many` | Add a whole list of `{product_id, quantity}` in one call. The main tool for a weekly fill. |
+| `product_add_to_cart` / `cart_remove_item` / `cart_set_quantity` | One product at a time. |
+| `cart_clear` | Empty the cart. Requires the literal confirmation `CLEAR CART`. |
+| `cart_get_recommendations` | Oda's own "people also add" for the current cart. |
+| `purchases_get_frequent` | Most-bought products across recent orders. Finds the staples. |
+| `orders_get_recent` | Recent orders with line items. Shows what was bought together, i.e. the dinners. |
+| `saved_lists_get_all` / `saved_lists_get_details` / `saved_list_add_to_cart` | Read saved Oda lists; add one to the cart with confirmation. |
+| `recipes_search` / `recipes_get_details` / `recipe_add_to_cart` / `recipe_remove_from_cart` | Oda's recipes, with ingredients-to-cart for N portions. |
+| `delivery_get_slots` | Upcoming slots and deadlines. Read-only. |
+| `check_login` | Session status, for troubleshooting. |
 
-* [Features](#features)
-* [Installation](#installation)
-* [Usage](#usage)
-  * [Initial Setup](#initial-setup)
-  * [CLI Commands](#cli-commands)
-  * [Configuration](#configuration)
-    * [Claude Desktop](#claude-desktop)
-    * [Claude Code](#claude-code)
-    * [Gemini CLI](#gemini-cli)
-* [Troubleshooting](#troubleshooting)
-  * [Session not persisting](#session-not-persisting)
+Removed from upstream: saved-list editing, the CLI, the `dump` discovery command.
 
-<!-- vim-markdown-toc -->
+## Settings (Railway → service → Variables)
 
-## Features
+| Setting | Required | Meaning |
+|---|---|---|
+| `MCP_BASE_PATH` | yes | The secret part of the connector address, e.g. `/mcp-<32 hex chars>`. Letters, digits, `-`, `_`; at least 24 characters. Too short and the endpoint refuses to serve. |
+| `ODA_EMAIL` | yes | The Oda account's email. |
+| `ODA_PASSWORD` | yes | The Oda account's password. Lives only here. |
+| `DATA_DIR` | no | Where session cookies are kept. Default `./data` (ephemeral; the service logs in again after a redeploy). |
 
-This MCP server provides tools to programmatically interact with Oda's grocery shopping platform:
+## Sign-in
 
-- **Search products** - Search for groceries with support for Norwegian terms
-- **Browse recipes** - Search, filter, and view recipe details
-- **Saved shopping lists** - View your saved lists, add or remove products, and
-  import a whole list into the cart
-- **Purchase history** - See your most frequently ordered products
-- **Manage shopping cart** - View cart contents and recommendations, add/remove items or set
-  exact quantities, add recipe ingredients
-- **Delivery slots** - See upcoming delivery slots, prices and ordering deadlines (read-only)
-- **CLI access** - All operations available as CLI subcommands in addition to MCP tools
-- **Session persistence** - Maintains login session across restarts
+Same secret-link method as the other Railway connectors: the service only answers at
+`https://<railway-domain><MCP_BASE_PATH>`. Every other address returns "Not Found".
+No OAuth. Treat the full address like a password. To rotate it, set a new
+`MCP_BASE_PATH` and re-add the connector in Claude.
 
-## Installation
+Oda login happens at boot and again automatically whenever Oda rejects the session.
+`GET /healthz` (public) shows `oda_login: ok` once it has worked, and the last error
+if not. Nothing on that page identifies the account or the path.
 
-This project requires Node.js (v18+).
+## Deploying
 
-## Usage
+Railway, from this repo (Railpack detects Node 22, `npm ci`, `npm run build`, then
+`node dist/index.js`; `railway.json` sets the health check). Set the three variables,
+generate a domain, check `/healthz`. In Claude: Settings → Connectors → add custom
+connector with the full address.
 
-### Initial Setup
+## For the household
 
-Authenticate with your Oda account:
+`docs/` (Norwegian):
 
-```bash
-read -rsp "Oda password: " ODA_PASSWORD; printf '\n'
-printf '%s' "$ODA_PASSWORD" | npx github:gbbirkisson/mcp-oda auth login --user your@email.com --pass-stdin
-unset ODA_PASSWORD
+- `OPPSETT-HENRIK.md` – one-time setup checklist
+- `PROSJEKT-INSTRUKSJONER.md` – the Claude Project instructions
+- `OPPSTART.md` – the first-run prompt that builds the staples and dinner lists from order history
+- `SLIK-BRUKER-DU-DET.md` – how to use it, for the person doing the shopping
+
+## Development
+
+```
+npm ci
+npm run build
+npm test        # offline tests of the Oda page/API parsing
+npm run lint
 ```
 
-Verify your login status:
+To run locally: `MCP_BASE_PATH=/mcp-<long random> ODA_EMAIL=… ODA_PASSWORD=… PORT=8080 node dist/index.js`
 
-```bash
-npx github:gbbirkisson/mcp-oda auth user
-```
+## Keeping up with Oda
 
-> [!NOTE]
-> Session data is stored by default in `~/.mcp-oda`
+Oda changes its site now and then. When search or cart calls start failing with
+"page structure may have changed", pull the latest `src/oda-client.ts` from upstream
+(`git fetch upstream` / compare on GitHub) and redeploy. Everything else in this fork is
+independent of upstream.
 
-### CLI Commands
-
-Running `npx github:gbbirkisson/mcp-oda` with no arguments prints help. The `mcp` subcommand
-starts the MCP server. All other operations are available as subcommands:
-
-```bash
-# Start the MCP server
-npx github:gbbirkisson/mcp-oda mcp
-
-# Products
-npx github:gbbirkisson/mcp-oda product search melk
-npx github:gbbirkisson/mcp-oda product search melk --page 2
-npx github:gbbirkisson/mcp-oda product add 132
-
-# Saved shopping lists
-npx github:gbbirkisson/mcp-oda saved-list list
-npx github:gbbirkisson/mcp-oda saved-list details 123
-# Adds a product to a saved list; requires an explicit confirmation string
-npx github:gbbirkisson/mcp-oda saved-list add-product 123 456 --confirmation "UPDATE SAVED LIST"
-# Removes a product from a saved list; requires an explicit confirmation string
-npx github:gbbirkisson/mcp-oda saved-list remove-product 123 456 --confirmation "UPDATE SAVED LIST"
-# Adds every list item to the cart; requires an explicit confirmation string
-npx github:gbbirkisson/mcp-oda saved-list add 123 --confirmation "ADD SAVED LIST TO CART"
-
-# Purchase history
-npx github:gbbirkisson/mcp-oda purchases frequent
-npx github:gbbirkisson/mcp-oda purchases frequent --limit 10 --max-orders 50
-
-# Cart
-npx github:gbbirkisson/mcp-oda cart list
-npx github:gbbirkisson/mcp-oda cart recommendations --limit 10 --exclude-in-cart
-npx github:gbbirkisson/mcp-oda cart remove 132
-# Sets the total quantity of a product; 0 removes it
-npx github:gbbirkisson/mcp-oda cart set 132 --count 3
-# Clears the whole cart; requires an explicit confirmation string
-npx github:gbbirkisson/mcp-oda cart clear --confirmation "CLEAR CART"
-
-# Recipes
-npx github:gbbirkisson/mcp-oda recipe search pizza
-npx github:gbbirkisson/mcp-oda recipe details 123
-npx github:gbbirkisson/mcp-oda recipe add 123 --portions 4
-npx github:gbbirkisson/mcp-oda recipe remove 123
-
-# Delivery slots and ordering deadlines (read-only)
-npx github:gbbirkisson/mcp-oda delivery slots
-
-# Authentication
-read -rsp "Oda password: " ODA_PASSWORD; printf '\n'
-printf '%s' "$ODA_PASSWORD" | npx github:gbbirkisson/mcp-oda auth login --user your@email.com --pass-stdin
-unset ODA_PASSWORD
-npx github:gbbirkisson/mcp-oda auth logout
-npx github:gbbirkisson/mcp-oda auth user
-
-# Maintenance
-npx github:gbbirkisson/mcp-oda clean
-```
-
-### Configuration
-
-#### Claude Desktop
-Claude Desktop configuration example:
-
-```json
-{
-  "mcpServers": {
-    "oda": {
-      "command": "npx",
-      "args": ["-y", "github:gbbirkisson/mcp-oda", "mcp"]
-    }
-  }
-}
-```
-
-#### Claude Code
-
-```bash
-/plugin marketplace add gbbirkisson/mcp-oda
-/plugin install mcp-oda@mcp-oda
-```
-
-#### Gemini CLI
-
-```bash
-gemini extensions install https://github.com/gbbirkisson/mcp-oda
-```
-
-## Troubleshooting
-
-### Session not persisting
-
-If your login session is not persisting between runs:
-
-1. Try running with the `clean` subcommand to remove old session data:
-   ```bash
-   npx github:gbbirkisson/mcp-oda clean
-   ```
-2. Re-authenticate:
-   ```bash
-   read -rsp "Oda password: " ODA_PASSWORD; printf '\n'
-   printf '%s' "$ODA_PASSWORD" | npx github:gbbirkisson/mcp-oda auth login --user your@email.com --pass-stdin
-   unset ODA_PASSWORD
-   ```
-3. Make sure you're using the same `--data-dir` for all commands if you've overridden the default.
+`UPSTREAM-CHANGELOG.md` is the upstream project's history up to the fork point.

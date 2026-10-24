@@ -17,6 +17,8 @@ import {
   DeliverySlot,
   DeliveryDay,
   DeliverySlots,
+  RecentOrder,
+  RecentOrderItem,
 } from "./types.js";
 import fs from "fs";
 
@@ -794,6 +796,92 @@ export class OdaClient {
       .slice(0, limit);
   }
 
+  /**
+   * Recent orders with their line items, newest first. Built on the same two
+   * endpoints getFrequentProducts uses; this one keeps the per-order grouping
+   * so a reader can see which products were bought together (a dinner).
+   */
+  async getRecentOrders(maxOrders = 20): Promise<RecentOrder[]> {
+    if (!Number.isInteger(maxOrders) || maxOrders <= 0 || maxOrders > 100) {
+      throw new Error(`max_orders must be an integer from 1 to 100: ${maxOrders}`);
+    }
+    let url: string | null = `${OdaClient.API_BASE}/api/v1/orders/`;
+    const summaries: Array<{ order_number: string; raw: any }> = [];
+    const visitedPages = new Set<string>();
+
+    while (url && summaries.length < maxOrders) {
+      if (visitedPages.has(url)) {
+        throw new Error(
+          `Get recent orders failed: order pagination repeated URL ${url}`,
+        );
+      }
+      visitedPages.add(url);
+      const response = await this.apiGet(url);
+      if (!response.ok) {
+        await this.throwApiError("Get recent orders list", response);
+      }
+      const page = (await response.json()) as any;
+      for (const month of page.results || []) {
+        for (const order of month.orders || []) {
+          if (order.order_number && summaries.length < maxOrders) {
+            summaries.push({ order_number: String(order.order_number), raw: order });
+          }
+        }
+      }
+      const next =
+        page.has_more && page.get_more_url ? String(page.get_more_url) : null;
+      url = next ? OdaClient.resolveOdaUrl(next, "order pagination URL") : null;
+    }
+
+    const orders: RecentOrder[] = [];
+    const CONCURRENCY = 5;
+    for (let i = 0; i < summaries.length; i += CONCURRENCY) {
+      const details = await Promise.all(
+        summaries.slice(i, i + CONCURRENCY).map(async (s) => {
+          const response = await this.apiGet(
+            `${OdaClient.API_BASE}/api/v1/orders/${encodeURIComponent(s.order_number)}/`,
+          );
+          if (!response.ok) {
+            await this.throwApiError(
+              `Get recent orders order ${s.order_number}`,
+              response,
+            );
+          }
+          return { summary: s, detail: (await response.json()) as any };
+        }),
+      );
+      for (const { summary, detail } of details) {
+        const items: RecentOrderItem[] = [];
+        for (const group of detail.items?.item_groups || []) {
+          for (const item of group.items || []) {
+            if (!Number.isFinite(item.product_id) || !item.description) continue;
+            const line: RecentOrderItem = {
+              product_id: item.product_id,
+              name: item.description,
+              quantity: Number(item.quantity) || 0,
+            };
+            if (group.title) line.group_title = group.title;
+            items.push(line);
+          }
+        }
+        const date =
+          detail.delivery?.delivery_date ||
+          detail.delivery_date ||
+          summary.raw.delivery_date ||
+          summary.raw.created_at ||
+          detail.created_at ||
+          "";
+        orders.push({
+          order_number: summary.order_number,
+          date: String(date),
+          total: parseFloat(detail.total_gross_amount ?? summary.raw.total_gross_amount) || 0,
+          items,
+        });
+      }
+    }
+    return orders;
+  }
+
   async getCartRecommendations(
     options: { limit?: number; excludeInCart?: boolean } = {},
   ): Promise<CartRecommendation[]> {
@@ -1094,6 +1182,30 @@ export class OdaClient {
     });
     if (!response.ok) {
       await this.throwApiError("Add to cart", response);
+    }
+    return this.cartAfterMutation(response);
+  }
+
+  /**
+   * Add several products in one request. The cart endpoint already takes a
+   * list, so a weekly shop of forty lines is one call rather than forty.
+   */
+  async addManyToCart(
+    items: Array<{ product_id: number; quantity: number }>,
+  ): Promise<Cart> {
+    const clean = items.filter(
+      (i) =>
+        Number.isInteger(i.product_id) &&
+        i.product_id > 0 &&
+        Number.isInteger(i.quantity) &&
+        i.quantity > 0,
+    );
+    if (clean.length === 0) {
+      throw new Error("No valid items to add (need product_id > 0 and quantity > 0)");
+    }
+    const response = await this.apiPost(OdaClient.CART_ITEMS_API, { items: clean });
+    if (!response.ok) {
+      await this.throwApiError("Add items to cart", response);
     }
     return this.cartAfterMutation(response);
   }

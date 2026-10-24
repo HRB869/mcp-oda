@@ -1,483 +1,105 @@
 #!/usr/bin/env node
-import { Command } from "commander";
-import { OdaServer } from "./server.js";
-import { OdaClient, summarizeCartMutation } from "./oda-client.js";
-import path from "path";
-import os from "os";
-import fs from "fs";
+/**
+ * Hosted entry point (Railway).
+ *
+ * Sign-in to this service is the secret link: the MCP endpoint lives only at
+ * MCP_BASE_PATH (e.g. /mcp-<32 hex>), the same method as the other Railway
+ * connectors. Every other path answers 404; /healthz is public and shows
+ * status only. No OAuth. Treat the full address like a password.
+ *
+ * Environment:
+ *   MCP_BASE_PATH  secret path, at least 24 random characters after the slash
+ *   ODA_EMAIL      the Oda account's email
+ *   ODA_PASSWORD   the Oda account's password
+ *   PORT           set by Railway
+ *   DATA_DIR       optional, where session cookies are kept (default ./data)
+ */
+
+import http from "node:http";
+import path from "node:path";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createRequire } from "node:module";
+import { OdaSession } from "./session.js";
+import { createMcpServer } from "./server.js";
 
 const { version } = createRequire(import.meta.url)("../package.json");
 
-const program = new Command();
-const homeDir = os.homedir();
-const defaultDataDir =
-  process.env.MCP_ODA_DATA_DIR || path.join(homeDir, ".mcp-oda");
-
-program
-  .name("mcp-oda")
-  .description("MCP server for Oda grocery store")
-  .version(version)
-  .option("--data-dir <path>", "Directory for session data", defaultDataDir);
-
-// Helper: create an OdaClient from the data dir
-function makeClient(): OdaClient {
-  const opts = program.opts();
-  const cookiePath = path.join(opts.dataDir, "cookies.json");
-  return new OdaClient(cookiePath);
+function problemWithConfig(): string | null {
+  const p = process.env.MCP_BASE_PATH ?? "";
+  if (!p.startsWith("/")) return "MCP_BASE_PATH must start with /";
+  if (p.length < 25) return "MCP_BASE_PATH too short (need 24+ characters after the slash)";
+  if (!/^\/[A-Za-z0-9_-]+$/.test(p)) return "MCP_BASE_PATH may only contain letters, digits, - and _";
+  if (!process.env.ODA_EMAIL) return "ODA_EMAIL is not set";
+  if (!process.env.ODA_PASSWORD) return "ODA_PASSWORD is not set";
+  return null;
 }
 
-// Default action: print help
-program.action(() => {
-  program.help();
-});
+const problem = problemWithConfig();
+const basePath = process.env.MCP_BASE_PATH ?? "";
+const dataDir = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
 
-// --- mcp subcommand ---
-program
-  .command("mcp")
-  .description("Start the MCP server")
-  .action(async () => {
-    const opts = program.opts();
-    const server = new OdaServer(opts.dataDir);
-    await server.start();
+const session = problem
+  ? null
+  : new OdaSession(process.env.ODA_EMAIL!, process.env.ODA_PASSWORD!, dataDir);
+
+if (problem) {
+  console.error(`MCP endpoint closed: ${problem}`);
+} else {
+  // Warm the session at boot so the first tool call is fast and /healthz is
+  // honest. A failure here is not fatal: tool calls retry the login.
+  session!.ensureLoggedIn().then((ok) => {
+    if (!ok) console.error(`oda: initial login failed: ${session!.getStatus().last_error}`);
   });
+}
 
-// --- auth commands (unchanged) ---
-// Read the password from stdin.
-//
-// fs.readFileSync(0) throws EAGAIN when stdin is a non-blocking pipe whose writer
-// has not produced any data yet -- e.g. `op read ... | mcp-oda auth login --pass-stdin`
-// where the secret manager needs a moment to unlock. Retry on EAGAIN instead of
-// failing the login.
-function readPasswordFromStdin(): string {
-  const chunks: Buffer[] = [];
-  const buf = Buffer.alloc(64 * 1024);
-  const idle = new Int32Array(new SharedArrayBuffer(4));
+function sendJson(res: http.ServerResponse, status: number, body: unknown) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
 
-  for (;;) {
-    let read: number;
-    try {
-      read = fs.readSync(0, buf, 0, buf.length, null);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EAGAIN") {
-        Atomics.wait(idle, 0, 0, 20); // sleep 20ms without spinning
-        continue;
-      }
-      if (code === "EOF") break;
-      throw err;
-    }
-    if (read === 0) break;
-    chunks.push(Buffer.from(buf.subarray(0, read)));
+const httpServer = http.createServer(async (req, res) => {
+  const url = new URL(req.url ?? "/", "http://localhost");
+
+  if (url.pathname === "/healthz") {
+    // Public: status and counts only, never the path or the account.
+    const s = session?.getStatus();
+    sendJson(res, 200, {
+      ok: !problem,
+      version,
+      mcp_endpoint: problem ? `closed: ${problem}` : "open",
+      oda_login: !session ? "n/a" : s!.logged_in ? "ok" : "not logged in",
+      oda_last_error: s?.last_error ?? null,
+    });
+    return;
   }
 
-  return Buffer.concat(chunks).toString("utf-8").replace(/\r?\n$/, "");
-}
+  if (problem || url.pathname !== basePath) {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not Found");
+    return;
+  }
 
-const authCmd = program.command("auth").description("Authentication commands");
-
-authCmd
-  .command("login")
-  .description("Log in with email and password")
-  .option("--user <email>", "Email for login")
-  .option(
-    "--pass <password>",
-    "Password for login (avoid: visible in shell history and process arguments)",
-  )
-  .option("--pass-stdin", "Read the password from standard input")
-  .action(async (cmdOpts) => {
-    const opts = program.opts();
-    const password = cmdOpts.passStdin
-      ? readPasswordFromStdin()
-      : cmdOpts.pass;
-    const server = new OdaServer(opts.dataDir);
-    await server.auth(cmdOpts.user, password);
+  // Stateless: a fresh server + transport per request. Tool registration is
+  // cheap and the Oda session underneath is shared.
+  const mcp = createMcpServer(session!);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
   });
-
-authCmd
-  .command("logout")
-  .description("Log out and remove stored credentials")
-  .action(() => {
-    const opts = program.opts();
-    const cookiePath = path.join(opts.dataDir, "cookies.json");
-    if (fs.existsSync(cookiePath)) {
-      fs.unlinkSync(cookiePath);
-      console.error("Logged out. Removed credentials.");
-    } else {
-      console.error("Already logged out.");
-    }
+  res.on("close", () => {
+    void transport.close();
+    void mcp.close();
   });
-
-authCmd
-  .command("user")
-  .description("Show current logged-in user")
-  .action(async () => {
-    const opts = program.opts();
-    const server = new OdaServer(opts.dataDir);
-    await server.checkUser();
-  });
-
-// --- product commands ---
-const productCmd = program.command("product").description("Product commands");
-
-productCmd
-  .command("search <query>")
-  .description("Search for products")
-  .option("--page <number>", "Page number", "1")
-  .action(async (query: string, cmdOpts) => {
-    const client = makeClient();
-    const result = await client.searchProducts(query, parseInt(cmdOpts.page));
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-productCmd
-  .command("add <id>")
-  .description("Add a product to the cart by ID")
-  .option("--count <number>", "Quantity to add", "1")
-  .action(async (id: string, cmdOpts) => {
-    const client = makeClient();
-    const productId = parseInt(id);
-    const cart = await client.addToCart(productId, parseInt(cmdOpts.count));
-    console.log(
-      JSON.stringify(summarizeCartMutation(cart, productId), null, 2),
-    );
-  });
-
-// --- saved-list commands ---
-const savedListCmd = program
-  .command("saved-list")
-  .description("Saved Oda shopping-list commands");
-
-savedListCmd
-  .command("list")
-  .description("List saved shopping lists")
-  .action(async () => {
-    const client = makeClient();
-    console.log(JSON.stringify(await client.getSavedLists(), null, 2));
-  });
-
-savedListCmd
-  .command("details <id>")
-  .description("Show products and quantities in a saved shopping list")
-  .action(async (id: string) => {
-    const client = makeClient();
-    console.log(
-      JSON.stringify(await client.getSavedListDetails(parseInt(id)), null, 2),
-    );
-  });
-
-savedListCmd
-  .command("add-product <list-id> <product-id>")
-  .description("Add a product to a saved shopping list")
-  .option("--quantity <number>", "Quantity to add", "1")
-  .requiredOption("--confirmation <text>", "Must be exactly UPDATE SAVED LIST")
-  .action(async (listId: string, productId: string, cmdOpts) => {
-    if (cmdOpts.confirmation !== "UPDATE SAVED LIST") {
-      throw new Error("Confirmation must be exactly UPDATE SAVED LIST");
-    }
-    const client = makeClient();
-    await client.addProductToSavedList(
-      parseInt(listId),
-      parseInt(productId),
-      parseFloat(cmdOpts.quantity),
-    );
-    console.log("Product added to saved list.");
-  });
-
-savedListCmd
-  .command("remove-product <list-id> <product-id>")
-  .description("Remove a product from a saved shopping list")
-  .requiredOption("--confirmation <text>", "Must be exactly UPDATE SAVED LIST")
-  .action(async (listId: string, productId: string, cmdOpts) => {
-    if (cmdOpts.confirmation !== "UPDATE SAVED LIST") {
-      throw new Error("Confirmation must be exactly UPDATE SAVED LIST");
-    }
-    const client = makeClient();
-    await client.removeProductFromSavedList(
-      parseInt(listId),
-      parseInt(productId),
-    );
-    console.log("Product removed from saved list.");
-  });
-
-savedListCmd
-  .command("add <id>")
-  .description("Add every product in a saved shopping list to the cart")
-  .requiredOption(
-    "--confirmation <text>",
-    "Must be exactly ADD SAVED LIST TO CART",
-  )
-  .action(async (id: string, cmdOpts) => {
-    if (cmdOpts.confirmation !== "ADD SAVED LIST TO CART") {
-      throw new Error("Confirmation must be exactly ADD SAVED LIST TO CART");
-    }
-    const client = makeClient();
-    await client.addSavedListToCart(parseInt(id));
-    console.log("Saved list added to cart.");
-  });
-
-// --- purchases commands ---
-const purchasesCmd = program
-  .command("purchases")
-  .description("Purchase-history commands");
-
-purchasesCmd
-  .command("frequent")
-  .description("Show the most frequently purchased products")
-  .option("--limit <number>", "Number of products to show", "20")
-  .option("--max-orders <number>", "How many recent orders to read", "30")
-  .action(async (cmdOpts) => {
-    const client = makeClient();
-    console.log(
-      JSON.stringify(
-        await client.getFrequentProducts(
-          parseInt(cmdOpts.limit),
-          parseInt(cmdOpts.maxOrders),
-        ),
-        null,
-        2,
-      ),
-    );
-  });
-
-// --- cart commands ---
-const cartCmd = program.command("cart").description("Cart commands");
-
-cartCmd
-  .command("list")
-  .description("List cart contents")
-  .action(async () => {
-    const client = makeClient();
-    const result = await client.getCartContents();
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-cartCmd
-  .command("remove <id>")
-  .description("Remove a product from the cart by ID")
-  .option("--count <number>", "Quantity to remove", "1")
-  .action(async (id: string, cmdOpts) => {
-    const client = makeClient();
-    const productId = parseInt(id);
-    const cart = await client.removeFromCart(
-      productId,
-      parseInt(cmdOpts.count),
-    );
-    console.log(
-      JSON.stringify(summarizeCartMutation(cart, productId), null, 2),
-    );
-  });
-
-cartCmd
-  .command("set <id>")
-  .description("Set the total quantity of a product in the cart")
-  .requiredOption("--count <number>", "Target quantity, 0 removes it")
-  .action(async (id: string, cmdOpts) => {
-    const client = makeClient();
-    const productId = parseInt(id);
-    const cart = await client.setCartQuantity(
-      productId,
-      parseInt(cmdOpts.count),
-    );
-    console.log(
-      JSON.stringify(summarizeCartMutation(cart, productId), null, 2),
-    );
-  });
-
-cartCmd
-  .command("clear")
-  .description("Clear the cart")
-  .requiredOption("--confirmation <text>", "Must be exactly CLEAR CART")
-  .action(async (cmdOpts) => {
-    if (cmdOpts.confirmation !== "CLEAR CART") {
-      throw new Error("Confirmation must be exactly CLEAR CART");
-    }
-    const client = makeClient();
-    await client.clearCart();
-    console.log("Cart cleared.");
-  });
-
-cartCmd
-  .command("recommendations")
-  .description("Show Oda's current cart recommendations")
-  .option("--limit <number>", "Maximum number of recommendations", "20")
-  .option("--exclude-in-cart", "Hide products already in the cart")
-  .action(async (cmdOpts) => {
-    const client = makeClient();
-    const recommendations = await client.getCartRecommendations({
-      limit: parseInt(cmdOpts.limit),
-      excludeInCart: cmdOpts.excludeInCart === true,
-    });
-    console.log(JSON.stringify(recommendations, null, 2));
-  });
-
-// --- recipe commands ---
-const recipeCmd = program.command("recipe").description("Recipe commands");
-
-recipeCmd
-  .command("search [query]")
-  .description("Search for recipes")
-  .option("--page <number>", "Page number", "1")
-  .option("--filter <ids...>", "Filter IDs")
-  .action(async (query: string | undefined, cmdOpts) => {
-    const client = makeClient();
-    const result = await client.searchRecipes(
-      query,
-      parseInt(cmdOpts.page),
-      cmdOpts.filter,
-    );
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-recipeCmd
-  .command("details <id>")
-  .description("Get recipe details by ID")
-  .action(async (id: string) => {
-    const client = makeClient();
-    const result = await client.getRecipeDetails(parseInt(id));
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-recipeCmd
-  .command("add <id>")
-  .description("Add recipe ingredients to cart")
-  .requiredOption("--portions <number>", "Number of portions")
-  .action(async (id: string, cmdOpts) => {
-    const client = makeClient();
-    await client.addRecipeToCart(parseInt(id), parseInt(cmdOpts.portions));
-    console.log("Recipe added to cart.");
-  });
-
-recipeCmd
-  .command("remove <id>")
-  .description("Remove a recipe from the cart")
-  .action(async (id: string) => {
-    const client = makeClient();
-    await client.removeRecipeFromCart(parseInt(id));
-    console.log("Recipe removed from cart.");
-  });
-
-// --- logs command ---
-program
-  .command("logs")
-  .description("Show error logs")
-  .option("--clear", "Clear the log file")
-  .action((cmdOpts) => {
-    const opts = program.opts();
-    const logPath = path.join(opts.dataDir, "mcp-oda.log");
-    if (cmdOpts.clear) {
-      if (fs.existsSync(logPath)) {
-        fs.unlinkSync(logPath);
-        console.error("Logs cleared.");
-      } else {
-        console.error("No logs found.");
-      }
-      return;
-    }
-    if (!fs.existsSync(logPath)) {
-      console.error("No logs found.");
-      return;
-    }
-    const content = fs.readFileSync(logPath, "utf-8");
-    if (!content.trim()) {
-      console.error("No logs found.");
-      return;
-    }
-    process.stdout.write(content);
-  });
-
-// --- clean command (unchanged) ---
-program
-  .command("clean")
-  .description("Remove the data directory")
-  .action(() => {
-    const opts = program.opts();
-    const dataDir = opts.dataDir;
-    if (fs.existsSync(dataDir)) {
-      fs.rmSync(dataDir, { recursive: true, force: true });
-      console.error(`Removed data directory: ${dataDir}`);
-    } else {
-      console.error(`Data directory does not exist: ${dataDir}`);
-    }
-  });
-
-// --- delivery commands ---
-const deliveryCmd = program
-  .command("delivery")
-  .description("Delivery information (read-only)");
-
-deliveryCmd
-  .command("slots")
-  .description("List upcoming delivery slots with ordering deadlines")
-  .action(async () => {
-    const client = makeClient();
-    console.log(JSON.stringify(await client.getDeliverySlots(), null, 2));
-  });
-
-// --- dump command (unchanged) ---
-program
-  .command("dump <url>")
-  .description("Fetch a URL and print its hydration data or JSON body")
-  .action(async (url: string) => {
-    const client = makeClient();
-
-    try {
-      const result = await client.dump(url);
-
-      console.log(`\n=== Response ===`);
-      console.log(`Status: ${result.status}`);
-      console.log(`Final URL: ${result.finalUrl}`);
-
-      console.log(`\n=== Headers ===`);
-      for (const [key, value] of Object.entries(result.headers)) {
-        console.log(`${key}: ${value}`);
-      }
-
-      console.log(`\n=== Query keys (${result.queryKeys.length}) ===`);
-      console.log(
-        result.queryKeys.length > 0
-          ? result.queryKeys.join("\n")
-          : "(none found)",
-      );
-
-      if (result.jsonBody !== null) {
-        console.log(`\n=== JSON body ===`);
-        console.log(JSON.stringify(result.jsonBody, null, 2));
-      } else {
-        console.log(`\n=== Hydration data ===`);
-        console.log(
-          result.nextData
-            ? JSON.stringify(result.nextData, null, 2)
-            : "(not found)",
-        );
-      }
-    } catch (e) {
-      console.error("Dump failed:", e);
-      process.exit(1);
-    }
-  });
-
-process.on("unhandledRejection", (err) => {
-  console.error(err);
-  process.exit(1);
+  try {
+    await mcp.connect(transport);
+    await transport.handleRequest(req, res);
+  } catch (e) {
+    console.error("request failed:", e instanceof Error ? e.message : e);
+    if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+  }
 });
 
-// Some Oda pages (recipe pages, notably) leave a referenced keep-alive
-// socket behind after the response body is fully consumed, so the event
-// loop never drains and the process hangs after the command has finished.
-// Exit explicitly once the command action resolves - except for the MCP
-// server, which must keep running on stdio.
-async function main() {
-  await program.parseAsync();
-  if (program.args[0] === "mcp") return;
-  // Let queued stdout writes drain before exiting.
-  await new Promise<void>((resolve) => {
-    process.stdout.write("", () => resolve());
-  });
-  process.exit(0);
-}
-
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : err);
-  process.exit(1);
+const port = Number(process.env.PORT ?? 8080);
+httpServer.listen(port, "0.0.0.0", () => {
+  console.error(`oda connector v${version} listening on ${port}${problem ? " (endpoint closed)" : ""}`);
 });

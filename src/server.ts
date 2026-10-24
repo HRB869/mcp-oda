@@ -1,442 +1,321 @@
+/**
+ * The MCP tool set, built fresh per request (stateless transport) on top of
+ * one shared Oda session. Trimmed from upstream mcp-oda to what a weekly
+ * family shop needs; saved-list editing and the CLI are gone.
+ *
+ * There is deliberately no checkout, no slot selection and no payment.
+ */
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createRequire } from "node:module";
-import { OdaClient, summarizeCartMutation } from "./oda-client.js";
-import fs from "fs";
-import path from "path";
+import { summarizeCartMutation } from "./oda-client.js";
+import type { OdaSession } from "./session.js";
 
 const { version } = createRequire(import.meta.url)("../package.json");
 
-export class OdaServer {
-  private mcpServer: McpServer;
-  private client: OdaClient | null = null;
-  private logPath: string;
+function jsonResult(data: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+  };
+}
 
-  constructor(private dataDir: string) {
-    this.logPath = path.join(dataDir, "mcp-oda.log");
-    this.mcpServer = new McpServer({ name: "mcp-oda", version });
-    this.registerTools();
+function textResult(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
 
-    process.on("SIGINT", () => {
-      process.exit(0);
-    });
-  }
+export function createMcpServer(session: OdaSession): McpServer {
+  const server = new McpServer({ name: "oda", version });
 
-  private getClient(): OdaClient {
-    if (!this.client) throw new Error("Client not initialized");
-    return this.client;
-  }
+  // Every tool runs through withAuth, so an expired Oda session is renewed
+  // transparently and the caller only sees real errors.
+  const run = <T>(fn: (client: OdaSession["client"]) => Promise<T>) =>
+    session.withAuth(fn);
 
-  private logError(tool: string, args: unknown, error: unknown) {
-    try {
-      fs.mkdirSync(this.dataDir, { recursive: true });
-      const entry = JSON.stringify({
-        timestamp: new Date().toISOString(),
-        level: "error",
-        tool,
-        args,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      fs.appendFileSync(this.logPath, entry + "\n");
-    } catch {
-      // Never let logging break the server
-    }
-  }
+  server.registerTool(
+    "check_login",
+    {
+      description:
+        "Whether the service is logged in to Oda, and as whom. Use when something looks wrong; not needed before normal calls.",
+    },
+    async () => {
+      await session.ensureLoggedIn();
+      return jsonResult(session.getStatus());
+    },
+  );
 
-  private toolHandler<T>(name: string, fn: (args: T) => Promise<any>) {
-    return async (args: T) => {
-      try {
-        return await fn(args);
-      } catch (e) {
-        this.logError(name, args, e);
-        throw e;
-      }
-    };
-  }
+  // --- Products and cart ---
 
-  private textResult(text: string) {
-    return { content: [{ type: "text" as const, text }] };
-  }
-
-  private jsonResult(data: unknown) {
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
-    };
-  }
-
-  private registerTools() {
-    this.mcpServer.registerTool(
-      "check_login",
-      {
-        description: "Check if the user is logged in to Oda.",
+  server.registerTool(
+    "products_search",
+    {
+      description:
+        "Search Oda's catalogue (Norwegian terms work best, e.g. 'lettmelk', 'kjøttdeig'). Returns products with id, name, price, availability and any discount. Use the id with product_add_to_cart / cart_add_many.",
+      inputSchema: {
+        query: z.string(),
+        page: z.number().int().positive().optional(),
       },
-      this.toolHandler("check_login", async () => {
-        const userName = await this.getClient().checkUser();
-        return this.jsonResult({ logged_in: !!userName });
-      }),
-    );
+    },
+    async ({ query, page }) =>
+      jsonResult(await run((c) => c.searchProducts(query, page))),
+  );
 
-    this.mcpServer.registerTool(
-      "cart_get_contents",
-      {
-        description:
-          "Get the current shopping cart: totals (display_price, item count) and items, with recipe grouping annotated per line.",
-      },
-      this.toolHandler("cart_get_contents", async () => {
-        return this.jsonResult(await this.getClient().getCartContents());
-      }),
-    );
+  server.registerTool(
+    "cart_get_contents",
+    {
+      description:
+        "The current cart: totals and every line, with recipe grouping noted per line.",
+    },
+    async () => jsonResult(await run((c) => c.getCartContents())),
+  );
 
-    this.mcpServer.registerTool(
-      "purchases_get_frequent",
-      {
-        description:
-          "Read the user's most frequently purchased products from recent Oda order history. Read-only; only use when the user asks for purchase-history-based suggestions.",
-        inputSchema: {
-          limit: z.number().int().min(1).max(50).optional(),
-          max_orders: z.number().int().min(1).max(100).optional(),
-        },
+  server.registerTool(
+    "product_add_to_cart",
+    {
+      description:
+        "Add one product to the cart by product id (relative: adds to whatever is there). Returns cart totals and the product's lines.",
+      inputSchema: {
+        id: z.number().int().positive(),
+        count: z.number().int().positive().optional(),
       },
-      this.toolHandler(
-        "purchases_get_frequent",
-        async ({ limit, max_orders }) => {
-          return this.jsonResult(
-            await this.getClient().getFrequentProducts(limit, max_orders),
-          );
-        },
-      ),
-    );
+    },
+    async ({ id, count }) => {
+      const cart = await run((c) => c.addToCart(id, count));
+      return jsonResult(summarizeCartMutation(cart, id));
+    },
+  );
 
-    this.mcpServer.registerTool(
-      "cart_get_recommendations",
-      {
-        description:
-          "Read Oda's current cart recommendations as a normalized product list. Read-only; recommendations may be empty when the cart is empty. Set exclude_in_cart to drop products already in the cart.",
-        inputSchema: {
-          limit: z.number().int().min(1).max(50).optional(),
-          exclude_in_cart: z.boolean().optional(),
-        },
-      },
-      this.toolHandler(
-        "cart_get_recommendations",
-        async ({ limit, exclude_in_cart }) => {
-          return this.jsonResult(
-            await this.getClient().getCartRecommendations({
-              limit,
-              excludeInCart: exclude_in_cart,
+  server.registerTool(
+    "cart_add_many",
+    {
+      description:
+        "Add many products to the cart in one call (relative quantities). Preferred for filling a weekly shop: pass the whole list once. Returns the resulting cart totals and line count.",
+      inputSchema: {
+        items: z
+          .array(
+            z.object({
+              product_id: z.number().int().positive(),
+              quantity: z.number().int().positive(),
             }),
-          );
-        },
+          )
+          .min(1)
+          .max(200),
+      },
+    },
+    async ({ items }) => {
+      const cart = await run((c) => c.addManyToCart(items));
+      return jsonResult({
+        label_text: cart.label_text,
+        product_quantity_count: cart.product_quantity_count,
+        display_price: cart.display_price,
+        lines: cart.items.length,
+      });
+    },
+  );
+
+  server.registerTool(
+    "cart_set_quantity",
+    {
+      description:
+        "Set the ABSOLUTE quantity of a product in the cart (0 removes it). Counts all lines for the product, recipe lines included.",
+      inputSchema: {
+        id: z.number().int().positive(),
+        quantity: z.number().int().min(0),
+      },
+    },
+    async ({ id, quantity }) => {
+      const cart = await run((c) => c.setCartQuantity(id, quantity));
+      return jsonResult(summarizeCartMutation(cart, id));
+    },
+  );
+
+  server.registerTool(
+    "cart_remove_item",
+    {
+      description:
+        "Remove a quantity of a product from the cart by product id (default 1).",
+      inputSchema: {
+        id: z.number().int().positive(),
+        count: z.number().int().positive().optional(),
+      },
+    },
+    async ({ id, count }) => {
+      const cart = await run((c) => c.removeFromCart(id, count));
+      return jsonResult(summarizeCartMutation(cart, id));
+    },
+  );
+
+  server.registerTool(
+    "cart_clear",
+    {
+      description:
+        "Remove everything from the cart. Destructive: only after the user has explicitly asked to clear the cart in this conversation.",
+      inputSchema: {
+        confirmation: z
+          .literal("CLEAR CART")
+          .describe(
+            "Must be exactly CLEAR CART; provide it only after explicit confirmation from the user in this conversation.",
+          ),
+      },
+    },
+    async () => {
+      await run((c) => c.clearCart());
+      return textResult("Cart cleared");
+    },
+  );
+
+  server.registerTool(
+    "cart_get_recommendations",
+    {
+      description:
+        "Oda's own suggestions for the current cart (things people usually add). Read-only; may be empty when the cart is empty.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(50).optional(),
+        exclude_in_cart: z.boolean().optional(),
+      },
+    },
+    async ({ limit, exclude_in_cart }) =>
+      jsonResult(
+        await run((c) =>
+          c.getCartRecommendations({ limit, excludeInCart: exclude_in_cart }),
+        ),
       ),
-    );
+  );
 
-    this.mcpServer.registerTool(
-      "saved_lists_get_all",
-      {
-        description:
-          "Get the user's saved Oda shopping lists and summary counts. Read-only; does not expose private list-sharing links.",
+  // --- History ---
+
+  server.registerTool(
+    "purchases_get_frequent",
+    {
+      description:
+        "Most frequently bought products across recent orders, with how many orders each appeared in. Read-only. Good for finding the household's staples.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(50).optional(),
+        max_orders: z.number().int().min(1).max(100).optional(),
       },
-      this.toolHandler("saved_lists_get_all", async () => {
-        return this.jsonResult(await this.getClient().getSavedLists());
-      }),
-    );
+    },
+    async ({ limit, max_orders }) =>
+      jsonResult(await run((c) => c.getFrequentProducts(limit, max_orders))),
+  );
 
-    this.mcpServer.registerTool(
-      "saved_lists_get_details",
-      {
-        description:
-          "Get the products and quantities in a saved Oda shopping list. Read-only; use a list ID from saved_lists_get_all.",
-        inputSchema: { id: z.number().int().positive() },
+  server.registerTool(
+    "orders_get_recent",
+    {
+      description:
+        "Recent orders, newest first, each with its line items (product id, name, quantity, recipe grouping if any). Read-only. Use to see what was bought together, e.g. to reconstruct the family's usual dinners. Default 20 orders; each order is one request to Oda, so keep max_orders modest.",
+      inputSchema: {
+        max_orders: z.number().int().min(1).max(100).optional(),
       },
-      this.toolHandler("saved_lists_get_details", async ({ id }) => {
-        return this.jsonResult(await this.getClient().getSavedListDetails(id));
-      }),
-    );
+    },
+    async ({ max_orders }) =>
+      jsonResult(await run((c) => c.getRecentOrders(max_orders))),
+  );
 
-    this.mcpServer.registerTool(
-      "saved_list_add_product",
-      {
-        description:
-          "Add a product to a saved Oda shopping list. This changes the saved list: call only after the user has explicitly confirmed the specific addition in the current conversation.",
-        inputSchema: {
-          list_id: z.number().int().positive(),
-          product_id: z.number().int().positive(),
-          quantity: z.number().int().positive().default(1),
-          confirmation: z
-            .literal("UPDATE SAVED LIST")
-            .describe(
-              "Must be the exact value UPDATE SAVED LIST; provide it only after explicit current-conversation user confirmation.",
-            ),
-        },
+  // --- Saved lists (read, and add a whole list to the cart) ---
+
+  server.registerTool(
+    "saved_lists_get_all",
+    {
+      description: "The account's saved Oda shopping lists with counts. Read-only.",
+    },
+    async () => jsonResult(await run((c) => c.getSavedLists())),
+  );
+
+  server.registerTool(
+    "saved_lists_get_details",
+    {
+      description:
+        "Products and quantities in one saved list (id from saved_lists_get_all). Read-only.",
+      inputSchema: { id: z.number().int().positive() },
+    },
+    async ({ id }) => jsonResult(await run((c) => c.getSavedListDetails(id))),
+  );
+
+  server.registerTool(
+    "saved_list_add_to_cart",
+    {
+      description:
+        "Add every product and quantity from a saved list to the cart. Changes the cart: only after the user has confirmed that list in this conversation.",
+      inputSchema: {
+        id: z.number().int().positive(),
+        confirmation: z
+          .literal("ADD SAVED LIST TO CART")
+          .describe(
+            "Must be exactly ADD SAVED LIST TO CART; provide it only after explicit confirmation from the user in this conversation.",
+          ),
       },
-      this.toolHandler(
-        "saved_list_add_product",
-        async ({ list_id, product_id, quantity }) => {
-          await this.getClient().addProductToSavedList(
-            list_id,
-            product_id,
-            quantity,
-          );
-          return this.textResult("Product added to saved list");
-        },
-      ),
-    );
+    },
+    async ({ id }) => {
+      await run((c) => c.addSavedListToCart(id));
+      return textResult("Saved list added to cart");
+    },
+  );
 
-    this.mcpServer.registerTool(
-      "saved_list_remove_product",
-      {
-        description:
-          "Remove a product from a saved Oda shopping list. This changes the saved list: call only after the user has explicitly confirmed the specific removal in the current conversation.",
-        inputSchema: {
-          list_id: z.number().int().positive(),
-          product_id: z.number().int().positive(),
-          confirmation: z
-            .literal("UPDATE SAVED LIST")
-            .describe(
-              "Must be the exact value UPDATE SAVED LIST; provide it only after explicit current-conversation user confirmation.",
-            ),
-        },
+  // --- Recipes ---
+
+  server.registerTool(
+    "recipes_search",
+    {
+      description:
+        "Search Oda's recipes (optionally by filter ids returned by a previous search).",
+      inputSchema: {
+        query: z.string().optional(),
+        page: z.number().int().positive().optional(),
+        filter_ids: z.array(z.string()).optional(),
       },
-      this.toolHandler(
-        "saved_list_remove_product",
-        async ({ list_id, product_id }) => {
-          await this.getClient().removeProductFromSavedList(
-            list_id,
-            product_id,
-          );
-          return this.textResult("Product removed from saved list");
-        },
-      ),
-    );
+    },
+    async ({ query, page, filter_ids }) =>
+      jsonResult(await run((c) => c.searchRecipes(query, page, filter_ids))),
+  );
 
-    this.mcpServer.registerTool(
-      "saved_list_add_to_cart",
-      {
-        description:
-          "Add every product and quantity from a saved Oda shopping list to the cart. This changes the cart: call only after the user has explicitly confirmed the specific list in the current conversation.",
-        inputSchema: {
-          id: z.number().int().positive(),
-          confirmation: z
-            .literal("ADD SAVED LIST TO CART")
-            .describe(
-              "Must be the exact value ADD SAVED LIST TO CART; provide it only after explicit current-conversation user confirmation.",
-            ),
-        },
+  server.registerTool(
+    "recipes_get_details",
+    {
+      description:
+        "A recipe's ingredients (with product ids where Oda links them), portions and steps.",
+      inputSchema: { id: z.number().int().positive() },
+    },
+    async ({ id }) => jsonResult(await run((c) => c.getRecipeDetails(id))),
+  );
+
+  server.registerTool(
+    "recipe_add_to_cart",
+    {
+      description:
+        "Add an Oda recipe's ingredients to the cart for a number of portions. Lines are grouped under the recipe in the cart.",
+      inputSchema: {
+        id: z.number().int().positive(),
+        portions: z.number().int().positive(),
       },
-      this.toolHandler("saved_list_add_to_cart", async ({ id }) => {
-        await this.getClient().addSavedListToCart(id);
-        return this.textResult("Saved list added to cart");
-      }),
-    );
+    },
+    async ({ id, portions }) => {
+      await run((c) => c.addRecipeToCart(id, portions));
+      return textResult("Recipe added to cart");
+    },
+  );
 
-    this.mcpServer.registerTool(
-      "cart_clear",
-      {
-        description:
-          "Remove all items from the shopping cart. Destructive: call only after the user has explicitly asked to clear the cart in the current conversation.",
-        inputSchema: {
-          confirmation: z
-            .literal("CLEAR CART")
-            .describe(
-              "Must be the exact value CLEAR CART; provide it only after explicit current-conversation user confirmation.",
-            ),
-        },
-      },
-      this.toolHandler("cart_clear", async () => {
-        await this.getClient().clearCart();
-        return this.textResult("Cart cleared");
-      }),
-    );
+  server.registerTool(
+    "recipe_remove_from_cart",
+    {
+      description: "Remove a recipe and its ingredients from the cart.",
+      inputSchema: { id: z.number().int().positive() },
+    },
+    async ({ id }) => {
+      await run((c) => c.removeRecipeFromCart(id));
+      return textResult("Recipe removed from cart");
+    },
+  );
 
-    this.mcpServer.registerTool(
-      "cart_remove_item",
-      {
-        description:
-          "Remove a product from the cart by product ID. Returns the cart totals and the product's remaining cart lines.",
-        inputSchema: {
-          id: z.number().int().positive(),
-          count: z.number().int().positive().optional(),
-        },
-      },
-      this.toolHandler("cart_remove_item", async ({ id, count }) => {
-        const cart = await this.getClient().removeFromCart(id, count);
-        return this.jsonResult(summarizeCartMutation(cart, id));
-      }),
-    );
+  // --- Delivery (read-only) ---
 
-    this.mcpServer.registerTool(
-      "cart_set_quantity",
-      {
-        description:
-          "Set the ABSOLUTE quantity of a product in the cart (add/remove apply relative deltas). Counts all cart lines for the product, recipe lines included. Quantity 0 removes it. Returns the cart totals and the product's cart lines.",
-        inputSchema: {
-          id: z.number().int().positive(),
-          quantity: z.number().int().min(0),
-        },
-      },
-      this.toolHandler("cart_set_quantity", async ({ id, quantity }) => {
-        const cart = await this.getClient().setCartQuantity(id, quantity);
-        return this.jsonResult(summarizeCartMutation(cart, id));
-      }),
-    );
+  server.registerTool(
+    "delivery_get_slots",
+    {
+      description:
+        "Upcoming delivery slots by day with prices and ordering deadlines. Read-only: nothing can be booked or paid through this service.",
+    },
+    async () => jsonResult(await run((c) => c.getDeliverySlots())),
+  );
 
-    this.mcpServer.registerTool(
-      "delivery_get_slots",
-      {
-        description:
-          "List upcoming delivery slots grouped by day, with per-slot ordering deadlines and prices. Read-only: no slot can be selected and no order can be placed through this server.",
-      },
-      this.toolHandler("delivery_get_slots", async () => {
-        return this.jsonResult(await this.getClient().getDeliverySlots());
-      }),
-    );
-
-    this.mcpServer.registerTool(
-      "products_search",
-      {
-        description: "Search for products on Oda.",
-        inputSchema: {
-          query: z.string(),
-          page: z.number().int().positive().optional(),
-        },
-      },
-      this.toolHandler("products_search", async ({ query, page }) => {
-        return this.jsonResult(
-          await this.getClient().searchProducts(query, page),
-        );
-      }),
-    );
-
-    this.mcpServer.registerTool(
-      "product_add_to_cart",
-      {
-        description:
-          "Add a product to the cart by product ID. Returns the cart totals and the product's cart lines.",
-        inputSchema: {
-          id: z.number().int().positive(),
-          count: z.number().int().positive().optional(),
-        },
-      },
-      this.toolHandler("product_add_to_cart", async ({ id, count }) => {
-        const cart = await this.getClient().addToCart(id, count);
-        return this.jsonResult(summarizeCartMutation(cart, id));
-      }),
-    );
-
-    this.mcpServer.registerTool(
-      "recipes_search",
-      {
-        description: "Search for recipes on Oda.",
-        inputSchema: {
-          query: z.string().optional(),
-          page: z.number().int().positive().optional(),
-          filter_ids: z.array(z.string()).optional(),
-        },
-      },
-      this.toolHandler(
-        "recipes_search",
-        async ({ query, page, filter_ids }) => {
-          return this.jsonResult(
-            await this.getClient().searchRecipes(query, page, filter_ids),
-          );
-        },
-      ),
-    );
-
-    this.mcpServer.registerTool(
-      "recipes_get_details",
-      {
-        description: "Get recipe details by recipe ID.",
-        inputSchema: { id: z.number().int().positive() },
-      },
-      this.toolHandler("recipes_get_details", async ({ id }) => {
-        return this.jsonResult(await this.getClient().getRecipeDetails(id));
-      }),
-    );
-
-    this.mcpServer.registerTool(
-      "recipe_add_to_cart",
-      {
-        description: "Add recipe ingredients to cart by recipe ID.",
-        inputSchema: {
-          id: z.number().int().positive(),
-          portions: z.number().int().positive(),
-        },
-      },
-      this.toolHandler("recipe_add_to_cart", async ({ id, portions }) => {
-        await this.getClient().addRecipeToCart(id, portions);
-        return this.textResult("Recipe added");
-      }),
-    );
-
-    this.mcpServer.registerTool(
-      "recipe_remove_from_cart",
-      {
-        description:
-          "Remove a recipe and its ingredients from the cart by recipe ID.",
-        inputSchema: { id: z.number().int().positive() },
-      },
-      this.toolHandler("recipe_remove_from_cart", async ({ id }) => {
-        await this.getClient().removeRecipeFromCart(id);
-        return this.textResult("Recipe removed");
-      }),
-    );
-  }
-
-  async start() {
-    fs.mkdirSync(this.dataDir, { recursive: true });
-
-    const cookiePath = path.join(this.dataDir, "cookies.json");
-    this.client = new OdaClient(cookiePath);
-
-    const transport = new StdioServerTransport();
-    await this.mcpServer.connect(transport);
-    console.error("MCP Oda Server running on stdio");
-  }
-
-  // Auth helper
-  async auth(username?: string, password?: string) {
-    if (!username || !password) {
-      console.error("HTTP-based auth requires --user and --pass arguments.");
-      console.error("Usage: mcp-oda auth login --user <email> --pass-stdin");
-      process.exit(1);
-    }
-
-    fs.mkdirSync(this.dataDir, { recursive: true });
-    const cookiePath = path.join(this.dataDir, "cookies.json");
-    const client = new OdaClient(cookiePath);
-
-    console.error("Attempting automated login...");
-    const success = await client.login(username, password);
-
-    if (success) {
-      const userName = await client.checkUser();
-      if (userName) {
-        console.error(`Successfully logged in as: ${userName}`);
-      } else {
-        console.error("Login successful (could not determine name).");
-      }
-    } else {
-      console.error("Login failed. Please check your credentials.");
-      process.exit(1);
-    }
-  }
-
-  async checkUser() {
-    fs.mkdirSync(this.dataDir, { recursive: true });
-    const cookiePath = path.join(this.dataDir, "cookies.json");
-    const client = new OdaClient(cookiePath);
-
-    try {
-      const userName = await client.checkUser();
-      if (userName) {
-        console.error(`Logged in as: ${userName}`);
-      } else {
-        console.error("Not logged in.");
-      }
-    } catch (e) {
-      console.error("Failed to check user:", e);
-    }
-  }
+  return server;
 }
