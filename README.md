@@ -64,10 +64,9 @@ connector with the full address.
 
 `docs/` (Norwegian):
 
+- `ukeshandling/` – the Claude Project files: `INSTRUKSJONER.md` (project instructions), `grunnpakke.md` (weekly staples with product ids), `middager.md` (dinner repertoire + 15 Oda-recipe proposals), `huskeliste.md` (running list template), `SLIK-FUNGERER-DET.md` (how-to for the person shopping)
+
 - `OPPSETT-HENRIK.md` – one-time setup checklist
-- `PROSJEKT-INSTRUKSJONER.md` – the Claude Project instructions
-- `OPPSTART.md` – the first-run prompt that builds the staples and dinner lists from order history
-- `SLIK-BRUKER-DU-DET.md` – how to use it, for the person doing the shopping
 
 ## Development
 

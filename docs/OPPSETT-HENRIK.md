@@ -18,17 +18,12 @@ Sjekk: `https://<domene>/healthz` skal svare `{"ok": true, "oda_login": "ok", ..
 
 - Hun trenger Claude Pro (mobilappen må kunne bruke prosjekter og koblinger).
 - **Settings → Connectors → Add custom connector**: navn `Oda`, adresse `https://<domene><MCP_BASE_PATH>`. Ingen OAuth.
-- Lag prosjektet **«Handling»**. Lim inn `PROSJEKT-INSTRUKSJONER.md` under Instructions.
+- Lag prosjektet **«Ukeshandling»**. Lim inn `ukeshandling/INSTRUKSJONER.md` under Instructions. Last opp `grunnpakke.md`, `middager.md` og `huskeliste.md` som prosjektfiler.
 - Slå på Oda-koblingen i prosjektet (koblinger må slås på per samtale første gang; sjekk at den husker det).
-- Gi Claude-appen tilgang til Påminnelser når den spør.
 
-## 3. Påminnelser
+## 3. Første samtale
 
-På hennes iPhone: lag lista **«Handleliste»** i Påminnelser og del den med de i familien som skal kunne legge til. Siri-frasen «legg til X på handlelista» treffer den.
-
-## 4. Første samtale
-
-Ny samtale i «Handling», lim inn `OPPSTART.md`. Resultatet er to filer; last dem opp i prosjektet som `faste-varer.md` og `middager.md`. Så er det klart.
+Ny samtale i «Ukeshandling»: «ukeshandel». Gå gjennom en handel sammen med henne før hun gjør det alene. Gi henne `SLIK-FUNGERER-DET.md`.
 
 ## Vedlikehold
 
